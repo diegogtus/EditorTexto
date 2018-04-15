@@ -1,5 +1,10 @@
 Lector de texto creado en C.
 
-Uso:
+Compilar:
+$ make
 
+Ejecutar:
+$ lector
+
+Uso:
 CTRL-s: Salir
