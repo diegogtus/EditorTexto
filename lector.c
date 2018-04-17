@@ -6,6 +6,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -19,10 +20,12 @@
 /*** defines ***/
 #define LECTOR_VERSION "0.0.1"
 #define KILO_TAB_STOP 8
+#define KILO_QUIT_TIMES 3
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey {
+  BACKSPACE = 127,
   ARROW_LEFT = 1000,
   ARROW_RIGHT,
   ARROW_UP,
@@ -44,25 +47,31 @@ typedef struct erow {
 } erow;
 
 struct editorConfig {
-  int cx, cy;
-  int rx;
-  int rowoff;
+ int cx, cy;
+ int rx;
+ int rowoff;
  int coloff;
-int screenrows;
+ int screenrows;
  int screencols;
-  int numrows;
-  erow *row;
-  char *filename;
-  char statusmsg[80];
-  time_t statusmsg_time;
+ int numrows;
+ erow *row;
+ int dirty;
+ char *filename;
+ char statusmsg[80];
+ time_t statusmsg_time;
  struct termios orig_termios;
 };
 
 struct editorConfig E;
 
+/*** prototypes ***/
+void editorSetStatusMessage(const char *fmt, ...);
+void editorRefreshScreen();
+char *editorPrompt(char *prompt);
+
 /*** terminal ***/
 
-void die(const char *s) {
+void die(const char *s) {/*Metodo captor de errores*/
   write(STDOUT_FILENO, "\x1b[2J", 4);
   write(STDOUT_FILENO, "\x1b[H", 3);
 
@@ -90,7 +99,7 @@ void enableRawMode() {
   	if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
 
-int editorReadKey() {
+int editorReadKey() {/*Metodo que lee las teclas presionadas desde teclado*/
   int nread;
   char c;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
@@ -102,7 +111,8 @@ if (c == '\x1b') {
     if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
     if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
 
-    if (seq[0] == '[') {
+    if (seq[0] == '[') {/*Se verifica que tipo de tecla especial fue
+					 presionada con la secuencia [~NUMERO*/
        if (seq[1] >= '0' && seq[1] <= '9') {
         if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
         if (seq[2] == '~') {
@@ -155,7 +165,8 @@ char buf[32];
   return 0;
 }
 
-int getWindowSize(int *rows, int *cols) {
+int getWindowSize(int *rows, int *cols) {/*Obtiene el tamaño de la pantalla
+					para adaptarlo a la misma*/
   struct winsize ws;
 
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
@@ -201,10 +212,11 @@ void editorUpdateRow(erow *row) {
   row->rsize = idx;
 }
 
-void editorAppendRow(char *s, size_t len) {
- E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+void editorInsertRow(int at, char *s, size_t len) {
+  if (at < 0 || at > E.numrows) return;
+  E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+  memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
 
-int at = E.numrows;
   E.row[at].size = len;
   E.row[at].chars = malloc(len + 1);
   memcpy(E.row[at].chars, s, len);
@@ -215,12 +227,111 @@ int at = E.numrows;
   editorUpdateRow(&E.row[at]);
 
   E.numrows++;
+  E.dirty++;
 
 }
 
+void editorFreeRow(erow *row) {
+  free(row->render);
+  free(row->chars);
+}
+void editorDelRow(int at) {
+  if (at < 0 || at >= E.numrows) return;
+  editorFreeRow(&E.row[at]);
+  memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+  E.numrows--;
+  E.dirty++;
+}
+
+void editorRowInsertChar(erow *row, int at, int c) {
+  if (at < 0 || at > row->size) at = row->size;
+  row->chars = realloc(row->chars, row->size + 2);
+  memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+  row->size++;
+  row->chars[at] = c;
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
+void editorRowAppendString(erow *row, char *s, size_t len) {
+  row->chars = realloc(row->chars, row->size + len + 1);
+  memcpy(&row->chars[row->size], s, len);
+  row->size += len;
+  row->chars[row->size] = '\0';
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
+void editorRowDelChar(erow *row, int at) {
+  if (at < 0 || at >= row->size) return;
+  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+  row->size--;
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
+/*** editor operations ***/
+
+void editorInsertChar(int c) {
+  if (E.cy == E.numrows) {
+    editorInsertRow(E.numrows, "", 0);
+  }
+  editorRowInsertChar(&E.row[E.cy], E.cx, c);
+  E.cx++;
+}
+
+void editorInsertNewline() {
+  if (E.cx == 0) {
+    editorInsertRow(E.cy, "", 0);
+  } else {
+    erow *row = &E.row[E.cy];
+    editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+    row = &E.row[E.cy];
+    row->size = E.cx;
+    row->chars[row->size] = '\0';
+    editorUpdateRow(row);
+  }
+  E.cy++;
+  E.cx = 0;
+}
+
+void editorDelChar() {
+  if (E.cy == E.numrows) return;
+  if (E.cx == 0 && E.cy == 0) return;
+  erow *row = &E.row[E.cy];
+  if (E.cx > 0) {
+    editorRowDelChar(row, E.cx - 1);
+    E.cx--;
+  } else {
+    E.cx = E.row[E.cy - 1].size;
+    editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
+    editorDelRow(E.cy);
+    E.cy--;
+  }
+}
+
+
 /*** file i/o ***/
 
-void editorOpen(char *filename) {
+char *editorRowsToString(int *buflen) {
+  int totlen = 0;
+  int j;
+  for (j = 0; j < E.numrows; j++)
+    totlen += E.row[j].size + 1;
+  *buflen = totlen;
+  char *buf = malloc(totlen);
+  char *p = buf;
+  for (j = 0; j < E.numrows; j++) {
+    memcpy(p, E.row[j].chars, E.row[j].size);
+    p += E.row[j].size;
+    *p = '\n';
+    p++;
+  }
+  return buf;
+}
+
+
+void editorOpen(char *filename) {/*Metodo que abre los archivos*/
   free(E.filename);
   E.filename = strdup(filename);
 
@@ -230,15 +341,44 @@ void editorOpen(char *filename) {
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
-  linelen = getline(&line, &linecap, fp);
+  linelen = getline(&line, &linecap, fp);/*Se realiza la lectura hasta -1*/
   while ((linelen = getline(&line, &linecap, fp)) != -1) {
     while (linelen > 0 && (line[linelen - 1] == '\n' ||
                            line[linelen - 1] == '\r'))
       linelen--;
-   editorAppendRow(line, linelen);
+    editorInsertRow(E.numrows, line, linelen);
   }
  free(line);
  fclose(fp);
+ E.dirty = 0;
+}
+
+void editorSave() {
+  if (E.filename == NULL) {
+      E.filename = editorPrompt("Guardar como: %s (ESC to cancel)");
+    if (E.filename == NULL) {
+      editorSetStatusMessage("Guardar cancelado");
+      return;
+    }
+  }
+
+ int len;
+  char *buf = editorRowsToString(&len);
+  int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+  if (fd != -1) {
+    if (ftruncate(fd, len) != -1) {
+      if (write(fd, buf, len) == len) {
+        close(fd);
+        free(buf);
+	E.dirty = 0;
+        editorSetStatusMessage("%d bytes escritos en disco", len);
+        return;
+      }
+    }
+    close(fd);
+  }
+  free(buf);
+  editorSetStatusMessage("Imposible guardar! I/O error: %s", strerror(errno));
 }
 
 /*** append buffer ***/
@@ -262,7 +402,7 @@ void abFree(struct abuf *ab) {
 
 /*** output ***/
 
-void editorScroll() {
+void editorScroll() {/*Metodo para desplazarse en el archivo*/
   E.rx = 0;
   if (E.cy < E.numrows) {
     E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
@@ -282,7 +422,8 @@ void editorScroll() {
   }
 }
 
-void editorDrawRows(struct abuf *ab) {
+void editorDrawRows(struct abuf *ab) {/*Metodo muestra en pantalla el mensaje
+					de bienvenida*/
   int y;
   for (y = 0; y < E.screenrows; y++) {
    int filerow = y + E.rowoff;
@@ -313,11 +454,13 @@ void editorDrawRows(struct abuf *ab) {
   }
 }
 
-void editorDrawStatusBar(struct abuf *ab) {
-   abAppend(ab, "\x1b[7m", 4);
+void editorDrawStatusBar(struct abuf *ab) {/*Metodo que dibuja en pantalla
+					la barra de ayuda de abajo*/
+  abAppend(ab, "\x1b[7m", 4);
   char status[80], rstatus[80];
-  int len = snprintf(status, sizeof(status), "%.20s - %d lines",
-    E.filename ? E.filename : "[No Name]", E.numrows);
+  int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+    E.filename ? E.filename : "[No Name]", E.numrows,
+    E.dirty ? "(modified)" : "");
   int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
     E.cy + 1, E.numrows);
   if (len > E.screencols) len = E.screencols;
@@ -335,7 +478,8 @@ void editorDrawStatusBar(struct abuf *ab) {
   abAppend(ab, "\r\n", 2);
 }
 
-void editorDrawMessageBar(struct abuf *ab) {
+void editorDrawMessageBar(struct abuf *ab) {/*Metodo que muestra la cantida
+			de lineas y palabras en el archivo*/
   abAppend(ab, "\x1b[K", 3);
   int msglen = strlen(E.statusmsg);
   if (msglen > E.screencols) msglen = E.screencols;
@@ -343,7 +487,8 @@ void editorDrawMessageBar(struct abuf *ab) {
     abAppend(ab, E.statusmsg, msglen);
 }
 
-void editorRefreshScreen() {
+void editorRefreshScreen() {/*Metodo que limpia la pantalla y carga la
+			del lector interfaz*/
   editorScroll();
 
   struct abuf ab = ABUF_INIT;
@@ -354,7 +499,7 @@ void editorRefreshScreen() {
   editorDrawRows(&ab);
   editorDrawStatusBar(&ab);
   editorDrawMessageBar(&ab);
- 
+
    char buf[32];
    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
                                             (E.rx - E.coloff) + 1);
@@ -366,7 +511,8 @@ write(STDOUT_FILENO, ab.b, ab.len);
   abFree(&ab);
 }
 
-void editorSetStatusMessage(const char *fmt, ...) {
+void editorSetStatusMessage(const char *fmt, ...) {/*Metodo que permite
+			obtener el estatus del archivo*/
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
@@ -376,7 +522,42 @@ void editorSetStatusMessage(const char *fmt, ...) {
 
 /*** input ***/
 
-void editorMoveCursor(int key) {
+char *editorPrompt(char *prompt) {
+  size_t bufsize = 128;
+  char *buf = malloc(bufsize);
+  size_t buflen = 0;
+  buf[0] = '\0';
+  while (1) {
+    editorSetStatusMessage(prompt, buf);
+    editorRefreshScreen();
+
+    int c = editorReadKey();
+
+
+    if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+      if (buflen != 0) buf[--buflen] = '\0';
+    } else if (c == '\x1b') {
+      editorSetStatusMessage("");
+      free(buf);
+      return NULL;
+    } else if (c == '\r') {
+    if (buflen != 0) {
+        editorSetStatusMessage("");
+        return buf;
+      }
+    } else if (!iscntrl(c) && c < 128) {
+      if (buflen == bufsize - 1) {
+        bufsize *= 2;
+        buf = realloc(buf, bufsize);
+      }
+      buf[buflen++] = c;
+      buf[buflen] = '\0';
+    }
+  }
+}
+
+void editorMoveCursor(int key) {/*Metodo que reconoce las teclas de
+           desplazamiento y permite moverse arriba, abajo, derecha e izquierda*/
 
  erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
 
@@ -418,14 +599,32 @@ void editorMoveCursor(int key) {
 
 
 
-void editorProcessKeypress() {
+void editorProcessKeypress() {/*Metodo que reconoce las teclas especiales como
+			HOME,END, PAGEUP, PAGEDOWN*/
+	static int quit_times = KILO_QUIT_TIMES;
+
 	int c = editorReadKey();
 	switch (c) {
+    		case '\r':
+     		editorInsertNewline();
+	        break;
+
 		case CTRL_KEY('S'):
+		 if (E.dirty && quit_times > 0) {
+        	  editorSetStatusMessage("ATENCION! El archivo posee cambios sin guardar. "
+          	    "Presiona Ctrl-S %d mas veces para salir.", quit_times);
+        	quit_times--;
+        	return;
+      		}
+
 		write(STDOUT_FILENO, "\x1b[2J", 4);
       		write(STDOUT_FILENO, "\x1b[H", 3);
 		exit(0);
 		break;
+
+		case CTRL_KEY('G'):
+      		editorSave();
+      		break;
 
 		case HOME_KEY:
       		E.cx = 0;
@@ -434,6 +633,13 @@ void editorProcessKeypress() {
 		case END_KEY:
       		if (E.cy < E.numrows)
         	  E.cx = E.row[E.cy].size;
+      		break;
+
+		case BACKSPACE:
+    		case CTRL_KEY('h'):
+    		case DEL_KEY:
+ 		      if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+      		      editorDelChar();
       		break;
 
     		case PAGE_UP:
@@ -457,12 +663,22 @@ void editorProcessKeypress() {
     		case ARROW_RIGHT:
       		editorMoveCursor(c);
       		break;
+
+		 case CTRL_KEY('l'):
+    		 case '\x1b':
+      		 break;
+
+		 default:
+      		 editorInsertChar(c);
+      		 break;
   }
+
+   quit_times = KILO_QUIT_TIMES;
 }
 
 /*** init ***/
 
-void initEditor() {
+void initEditor() {/*Metodo que inicializa los valores del programa*/
  E.cx = 0;
  E.cy = 0;
  E.rx = 0;
@@ -470,6 +686,7 @@ void initEditor() {
  E.coloff = 0;
  E.numrows = 0;
  E.row = NULL;
+ E.dirty = 0;
  E.filename = NULL;
  E.statusmsg[0] = '\0';
  E.statusmsg_time = 0;
@@ -478,14 +695,15 @@ if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
     E.screenrows -= 2;
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[]) {/*Metodo principal del programa encargado de
+					 ejecutar los demas metodos derivados*/
   	enableRawMode();
 	initEditor();
 	if (argc >= 2) {
     		editorOpen(argv[1]);
   	}
 
-	  editorSetStatusMessage("AYUDA: Ctrl-S = salir");
+	  editorSetStatusMessage("AYUDA: CTRL-G = guardar | CTRL-S = salir");
 
 	while (1) {
 		editorRefreshScreen();
